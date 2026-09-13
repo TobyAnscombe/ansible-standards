@@ -11,6 +11,11 @@ This document was reviewed against the actual repos under `DevWork/claude`
 `github-actions`) rather than written from memory alone, so it reflects
 what's actually in place, not just what was originally intended.
 `ubuntu-user-creation` remains the most complete worked example.
+`ansible-proxmox-homepage` plus its three role repos
+(`ansible-role-lxc-provision`, `ansible-role-unifi`, `ansible-role-caddy`)
+are the source for the "Proxmox LXC provisioning pattern" section below —
+that pattern is now confirmed against a live Proxmox/UniFi/Caddy fleet, not
+just written to spec.
 
 ## Repository layout
 
@@ -90,6 +95,109 @@ assertions, which should be present in every role):
 Configuration is variable-driven: concrete values live in `vars/`
 (project-level) or `defaults/`/`vars/` (role-level), not hardcoded in
 tasks.
+
+## Proxmox LXC provisioning pattern
+
+Confirmed end-to-end against the live fleet via `ansible-proxmox-homepage`
+(2026-09-13): create an LXC, give it a stable IP, point DNS at it, deploy
+the app, register it with Caddy. Three cross-repo roles cover the
+reusable parts — `ansible-role-lxc-provision`, `ansible-role-unifi`,
+`ansible-role-caddy` — pulled in via `requirements.yml` like
+`ubuntu_manage_user`. A consuming repo (e.g. `ansible-proxmox-homepage`)
+supplies only its own `vars/<service>.yml` and an app-specific role.
+
+Playbook shape (three plays, one repo per app):
+
+```yaml
+- hosts: proxmox
+  roles: [lxc_provision]
+  post_tasks:
+    - include_role: {name: unifi}   # fixed IP, when: lxc_ip == 'dhcp'
+    - include_role: {name: unifi}   # DNS record, always
+
+- hosts: <app>                       # populated in-memory by lxc_provision's add_host
+  roles: [<app>]
+
+- hosts: caddy_lxc
+  tasks:
+    - include_role: {name: caddy, tasks_from: register_service}
+```
+
+**VMID/IP discovery** (`lxc_provision`): look up an existing container by
+hostname first — `pct list | awk -v h="<hostname>" 'NR>1 && $NF==h
+{print $1}'` — `Name` is confirmed the last column on real `pct list`
+output regardless of whether `Lock` is populated, so `$NF` is safe. Only
+allocate a fresh VMID (`pvesh get /cluster/nextid --output-format json`,
+which returns a JSON-quoted string like `"100"` — strip the quotes) when
+nothing matched. **This existing-hostname check is also the idempotency
+seam and a hazard**: if a run fails after `pct create` but before
+`pct start` completes, the *next* run's `pct list` match makes it treat
+the container as already existing and **silently skip create, bind
+mounts, start, and the SSH wait** — adopting a half-built container
+rather than fixing it. Don't blindly re-run after a mid-`create.yml`
+failure; check `pct status <vmid>` and consider `pct destroy` first.
+
+**Networking convention**: default new LXCs to `ip=dhcp` on `net0` (the
+fleet norm) and set a UniFi fixed-IP reservation afterward for a stable
+address — reserve a static `pct`-level IP only for the one LXC everything
+else's DNS must point at unconditionally (the Caddy LXC). Discover a
+DHCP-assigned address with `pct exec <vmid> -- hostname -I`, retried
+(DHCP takes a few seconds after `pct start`), then `add_host` it into a
+group for the app's own play.
+
+**UniFi has two unrelated APIs — do not conflate their site identifiers.**
+This is the one mistake actually made building this pattern, so it's
+recorded here to not be rediscovered the hard way:
+
+- *Network Integration API* (`/proxy/network/integration/v1/...`,
+  `X-API-Key` header) — used for DNS records. Site-scoped by
+  `unifi_site_id`, the site's **UUID**, e.g.
+  `.../sites/{{ unifi_site_id }}/dns/policies`.
+- *Legacy/local Network API* (`/proxy/network/api/s/{site}/...`,
+  session-cookie + `X-CSRF-Token` from `POST /api/auth/login`) — the only
+  surface that exposes client fixed-IP/DHCP-reservation assignment; the
+  Integration API doesn't have it at all. `{site}` here is the site's
+  short **`internalReference`** (e.g. `default`) — passing the
+  Integration API's UUID 401s with `api.err.NoSiteContext`. Resolve it
+  once via `GET .../integration/v1/sites` (matching `id` to
+  `unifi_site_id`, reading `.internalReference`) before making any legacy
+  call; `ansible-role-unifi`'s `legacy_login.yml` does this.
+
+**Registering with an already-running Caddy LXC**: a standalone
+`tasks_from: register_service` entrypoint (bypassing the role's normal
+`install`/`configure`) that only templates one `conf.d/<service>.caddy`
+snippet and reloads — the pattern any app repo should use to attach
+itself to a shared, independently-managed Caddy instance. Requires the
+target Caddy's live `Caddyfile` to already `import conf.d/*.caddy`;
+verify this once per Caddy LXC, not per consuming app.
+
+**Verifying a live run, not just its exit code**: check `pct list`
+directly on Proxmox; for UniFi, query the controller's own record for the
+client rather than trusting the task's `changed`/`ok` status alone
+(`GET .../stat/sta`, matched by MAC, checking `use_fixedip`/`fixed_ip`
+in the response — the same fields the UniFi UI's client-details panel
+reads) and confirm DNS resolution (`dig <name> @<router-ip>`); for the
+app itself, an actual HTTP request against its public hostname, not just
+`docker compose up` succeeding.
+
+**Debugging without materializing secrets**: never decrypt a vault or
+print an API key to check it's right. Let Ansible use it internally —
+write a throwaway task (delete it afterward) that makes the real API call
+and `debug`s only the non-secret response fields you need (site
+`internalReference`, a client's `use_fixedip`, an HTTP status code). This
+is how the `NoSiteContext` root cause above was found, without ever
+exposing `unifi_api_key` or the legacy account's password.
+
+**Iterating on a `requirements.yml`-installed role during development**:
+don't loop through `ansible-galaxy role install --force` for every edit —
+it re-clones from the pinned commit on GitHub, so nothing changes until
+you've committed *and pushed*. Instead edit the role's own sibling repo
+checkout directly and `rsync -a --exclude=.git --exclude=.ansible` it
+into the consumer's `roles/<name>/` for fast iteration. Once green:
+commit and push the role repo, bump `requirements.yml`'s pinned commit to
+that SHA, then do one clean `ansible-galaxy role install --force` and a
+final full run — that run is what actually proves the pinned state
+works, not the iterated-on copy.
 
 ## Security posture
 
@@ -224,6 +332,13 @@ These are inconsistencies found across the existing repos, not new rules
 - `ansible-control` has a stray literal directory named `{.github` at its
   root (left over from an mkdir that didn't get brace-expanded) — a
   one-off cleanup item, unrelated to these standards.
+- `ansible-role-lxc-provision`, `ansible-role-unifi`, and
+  `ansible-role-caddy` pin in `requirements.yml` by raw commit SHA
+  (`version: ef40080b3...`) rather than a semver tag like
+  `ubuntu_manage_user`'s `v1.1.10`. Acceptable while these are still
+  under active, single-consumer development, but they should move to
+  tagged releases once a second project consumes them or they stabilize —
+  consistent with the "promote to own repo" guidance above.
 
 ## Scope
 
